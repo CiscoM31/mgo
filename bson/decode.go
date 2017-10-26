@@ -41,12 +41,13 @@ type decoder struct {
 	in      []byte
 	i       int
 	docType reflect.Type
+	lenient bool // If true, be lenient when unmarshalling document. If false, return errors if BSON document is incompatible with receiving document.
 }
 
 var typeM = reflect.TypeOf(M{})
 
 func newDecoder(in []byte) *decoder {
-	return &decoder{in, 0, typeM}
+	return &decoder{in, 0, typeM, false}
 }
 
 // --------------------------------------------------------------------------
@@ -125,7 +126,7 @@ func clearMap(m reflect.Value) {
 	}
 }
 
-func (d *decoder) readDocTo(out reflect.Value) {
+func (d *decoder) readDocTo(out reflect.Value) error {
 	var elemType reflect.Type
 	outt := out.Type()
 	outk := outt.Kind()
@@ -141,7 +142,7 @@ func (d *decoder) readDocTo(out reflect.Value) {
 			if _, ok := err.(*TypeError); err != nil && !ok {
 				panic(err)
 			}
-			return
+			return nil
 		}
 		if outk == reflect.Ptr {
 			out = out.Elem()
@@ -214,11 +215,19 @@ func (d *decoder) readDocTo(out reflect.Value) {
 	case reflect.Slice:
 		switch outt.Elem() {
 		case typeDocElem:
-			origout.Set(d.readDocElems(outt))
-			return
+			v, err := d.readDocElems(outt)
+			if err != nil {
+				return nil
+			}
+			origout.Set(v)
+			return nil
 		case typeRawDocElem:
-			origout.Set(d.readRawDocElems(outt))
-			return
+			v, err := d.readRawDocElems(outt)
+			if err != nil {
+				return nil
+			}
+			origout.Set(v)
+			return nil
 		}
 		fallthrough
 	default:
@@ -240,12 +249,15 @@ func (d *decoder) readDocTo(out reflect.Value) {
 		switch outk {
 		case reflect.Map:
 			e := reflect.New(elemType).Elem()
-			if d.readElemTo(e, kind) {
+			err := d.readElemTo(e, kind)
+			if err == nil {
 				k := reflect.ValueOf(name)
 				if convertKey {
 					k = k.Convert(keyType)
 				}
 				out.SetMapIndex(k, e)
+			} else if !d.lenient {
+				return err
 			}
 		case reflect.Struct:
 			if outt == typeRaw {
@@ -253,20 +265,34 @@ func (d *decoder) readDocTo(out reflect.Value) {
 			} else {
 				if info, ok := fieldsMap[name]; ok {
 					if info.Inline == nil {
-						d.readElemTo(out.Field(info.Num), kind)
+						if err := d.readElemTo(out.Field(info.Num), kind); err != nil {
+							if !d.lenient {
+								return &TypeError{out.Field(info.Num).Type(), kind}
+							}
+						}
 					} else {
-						d.readElemTo(out.FieldByIndex(info.Inline), kind)
+						if err := d.readElemTo(out.FieldByIndex(info.Inline), kind); err != nil {
+							if !d.lenient {
+								return &TypeError{out.FieldByIndex(info.Inline).Type(), kind}
+							}
+						}
 					}
 				} else if inlineMap.IsValid() {
 					if inlineMap.IsNil() {
 						inlineMap.Set(reflect.MakeMap(inlineMap.Type()))
 					}
 					e := reflect.New(elemType).Elem()
-					if d.readElemTo(e, kind) {
+					if err := d.readElemTo(e, kind); err == nil {
 						inlineMap.SetMapIndex(reflect.ValueOf(name), e)
+					} else {
+						if !d.lenient {
+							return &TypeError{e.Type(), kind}
+						}
 					}
 				} else {
-					d.dropElem(kind)
+					if err := d.dropElem(kind); err != nil {
+						return err
+					}
 				}
 			}
 		case reflect.Slice:
@@ -285,9 +311,10 @@ func (d *decoder) readDocTo(out reflect.Value) {
 	if outt == typeRaw {
 		out.Set(reflect.ValueOf(Raw{0x03, d.in[start:d.i]}))
 	}
+	return nil
 }
 
-func (d *decoder) readArrayDocTo(out reflect.Value) {
+func (d *decoder) readArrayDocTo(out reflect.Value) error {
 	end := int(d.readInt32())
 	end += d.i - 4
 	if end <= d.i || end > len(d.in) || d.in[end-1] != '\x00' {
@@ -307,7 +334,11 @@ func (d *decoder) readArrayDocTo(out reflect.Value) {
 			corrupted()
 		}
 		d.i++
-		d.readElemTo(out.Index(i), kind)
+		if err := d.readElemTo(out.Index(i), kind); err != nil {
+			if !d.lenient {
+				return &TypeError{out.Index(i).Type(), kind}
+			}
+		}
 		if d.i >= end {
 			corrupted()
 		}
@@ -320,14 +351,15 @@ func (d *decoder) readArrayDocTo(out reflect.Value) {
 	if d.i != end {
 		corrupted()
 	}
+	return nil
 }
 
-func (d *decoder) readSliceDoc(t reflect.Type) interface{} {
+func (d *decoder) readSliceDoc(t reflect.Type) (interface{}, error) {
 	tmp := make([]reflect.Value, 0, 8)
 	elemType := t.Elem()
 	if elemType == typeRawDocElem {
 		d.dropElem(0x04)
-		return reflect.Zero(t).Interface()
+		return reflect.Zero(t).Interface(), nil
 	}
 
 	end := int(d.readInt32())
@@ -345,8 +377,12 @@ func (d *decoder) readSliceDoc(t reflect.Type) interface{} {
 		}
 		d.i++
 		e := reflect.New(elemType).Elem()
-		if d.readElemTo(e, kind) {
+		if err := d.readElemTo(e, kind); err == nil {
 			tmp = append(tmp, e)
+		} else {
+			if !d.lenient {
+				return nil, &TypeError{e.Type(), kind}
+			}
 		}
 		if d.i >= end {
 			corrupted()
@@ -362,47 +398,63 @@ func (d *decoder) readSliceDoc(t reflect.Type) interface{} {
 	for i := 0; i != n; i++ {
 		slice.Index(i).Set(tmp[i])
 	}
-	return slice.Interface()
+	return slice.Interface(), nil
 }
 
 var typeSlice = reflect.TypeOf([]interface{}{})
 var typeIface = typeSlice.Elem()
 
-func (d *decoder) readDocElems(typ reflect.Type) reflect.Value {
+func (d *decoder) readDocElems(typ reflect.Type) (reflect.Value, error) {
 	docType := d.docType
 	d.docType = typ
 	slice := make([]DocElem, 0, 8)
-	d.readDocWith(func(kind byte, name string) {
+	err := d.readDocWith(func(kind byte, name string) error {
 		e := DocElem{Name: name}
 		v := reflect.ValueOf(&e.Value)
-		if d.readElemTo(v.Elem(), kind) {
+		if err := d.readElemTo(v.Elem(), kind); err == nil {
 			slice = append(slice, e)
+		} else {
+			if !d.lenient {
+				return err
+			}
 		}
+		return nil
 	})
+	if err != nil && !d.lenient {
+		return reflect.ValueOf(nil), err
+	}
 	slicev := reflect.New(typ).Elem()
 	slicev.Set(reflect.ValueOf(slice))
 	d.docType = docType
-	return slicev
+	return slicev, nil
 }
 
-func (d *decoder) readRawDocElems(typ reflect.Type) reflect.Value {
+func (d *decoder) readRawDocElems(typ reflect.Type) (reflect.Value, error) {
 	docType := d.docType
 	d.docType = typ
 	slice := make([]RawDocElem, 0, 8)
-	d.readDocWith(func(kind byte, name string) {
+	err := d.readDocWith(func(kind byte, name string) error {
 		e := RawDocElem{Name: name}
 		v := reflect.ValueOf(&e.Value)
-		if d.readElemTo(v.Elem(), kind) {
+		if err := d.readElemTo(v.Elem(), kind); err == nil {
 			slice = append(slice, e)
+		} else {
+			if !d.lenient {
+				return err
+			}
 		}
+		return nil
 	})
+	if err != nil && !d.lenient {
+		return reflect.ValueOf(nil), err
+	}
 	slicev := reflect.New(typ).Elem()
 	slicev.Set(reflect.ValueOf(slice))
 	d.docType = docType
-	return slicev
+	return slicev, nil
 }
 
-func (d *decoder) readDocWith(f func(kind byte, name string)) {
+func (d *decoder) readDocWith(f func(kind byte, name string) error) error {
 	end := int(d.readInt32())
 	end += d.i - 4
 	if end <= d.i || end > len(d.in) || d.in[end-1] != '\x00' {
@@ -414,7 +466,10 @@ func (d *decoder) readDocWith(f func(kind byte, name string)) {
 		if d.i >= end {
 			corrupted()
 		}
-		f(kind, name)
+		err := f(kind, name)
+		if err != nil {
+			return err
+		}
 		if d.i >= end {
 			corrupted()
 		}
@@ -423,6 +478,7 @@ func (d *decoder) readDocWith(f func(kind byte, name string)) {
 	if d.i != end {
 		corrupted()
 	}
+	return nil
 }
 
 // --------------------------------------------------------------------------
@@ -430,14 +486,14 @@ func (d *decoder) readDocWith(f func(kind byte, name string)) {
 
 var blackHole = settableValueOf(struct{}{})
 
-func (d *decoder) dropElem(kind byte) {
-	d.readElemTo(blackHole, kind)
+func (d *decoder) dropElem(kind byte) error {
+	return d.readElemTo(blackHole, kind)
 }
 
 // Attempt to decode an element from the document and put it into out.
-// If the types are not compatible, the returned ok value will be
-// false and out will be unchanged.
-func (d *decoder) readElemTo(out reflect.Value, kind byte) (good bool) {
+// If the types are not compatible, an error is returned and out will be unchanged.
+func (d *decoder) readElemTo(out reflect.Value, kind byte) (err error) {
+	var v reflect.Value
 
 	start := d.i
 
@@ -447,26 +503,31 @@ func (d *decoder) readElemTo(out reflect.Value, kind byte) (good bool) {
 		outk := out.Kind()
 		switch outk {
 		case reflect.Interface, reflect.Ptr, reflect.Struct, reflect.Map:
-			d.readDocTo(out)
-			return true
+			return d.readDocTo(out)
 		}
 		if setterStyle(outt) != setterNone {
-			d.readDocTo(out)
-			return true
+			return d.readDocTo(out)
 		}
 		if outk == reflect.Slice {
 			switch outt.Elem() {
 			case typeDocElem:
-				out.Set(d.readDocElems(outt))
+				v, err = d.readDocElems(outt)
+				if err != nil && !d.lenient {
+					return err
+				}
+				out.Set(v)
 			case typeRawDocElem:
-				out.Set(d.readRawDocElems(outt))
+				v, err = d.readRawDocElems(outt)
+				if err != nil && !d.lenient {
+					return err
+				}
+				out.Set(v)
 			default:
-				d.readDocTo(blackHole)
+				return d.readDocTo(blackHole)
 			}
-			return true
+			return nil
 		}
-		d.readDocTo(blackHole)
-		return true
+		return d.readDocTo(blackHole)
 	}
 
 	var in interface{}
@@ -482,7 +543,10 @@ func (d *decoder) readElemTo(out reflect.Value, kind byte) (good bool) {
 		outt := out.Type()
 		if setterStyle(outt) != setterNone {
 			// Skip the value so its data is handed to the setter below.
-			d.dropElem(kind)
+			err = d.dropElem(kind)
+			if err != nil {
+				return err
+			}
 			break
 		}
 		for outt.Kind() == reflect.Ptr {
@@ -490,12 +554,17 @@ func (d *decoder) readElemTo(out reflect.Value, kind byte) (good bool) {
 		}
 		switch outt.Kind() {
 		case reflect.Array:
-			d.readArrayDocTo(out)
-			return true
+			return d.readArrayDocTo(out)
 		case reflect.Slice:
-			in = d.readSliceDoc(outt)
+			in, err = d.readSliceDoc(outt)
+			if err != nil {
+				return err
+			}
 		default:
-			in = d.readSliceDoc(typeSlice)
+			in, err = d.readSliceDoc(typeSlice)
+			if err != nil {
+				return err
+			}
 		}
 	case 0x05: // Binary
 		b := d.readBinary()
@@ -531,7 +600,10 @@ func (d *decoder) readElemTo(out reflect.Value, kind byte) (good bool) {
 	case 0x0F: // JavaScript with scope
 		d.i += 4 // Skip length
 		js := JavaScript{d.readStr(), make(M)}
-		d.readDocTo(reflect.ValueOf(js.Scope))
+		err := d.readDocTo(reflect.ValueOf(js.Scope))
+		if err != nil {
+			return err
+		}
 		in = js
 	case 0x10: // Int32
 		in = int(d.readInt32())
@@ -556,27 +628,27 @@ func (d *decoder) readElemTo(out reflect.Value, kind byte) (good bool) {
 
 	if outt == typeRaw {
 		out.Set(reflect.ValueOf(Raw{kind, d.in[start:d.i]}))
-		return true
+		return nil
 	}
 
 	if setter := getSetter(outt, out); setter != nil {
 		err := setter.SetBSON(Raw{kind, d.in[start:d.i]})
 		if err == SetZero {
 			out.Set(reflect.Zero(outt))
-			return true
+			return nil
 		}
 		if err == nil {
-			return true
+			return nil
 		}
 		if _, ok := err.(*TypeError); !ok {
 			panic(err)
 		}
-		return false
+		return err
 	}
 
 	if in == nil {
 		out.Set(reflect.Zero(outt))
-		return true
+		return nil
 	}
 
 	outk := outt.Kind()
@@ -592,7 +664,7 @@ func (d *decoder) readElemTo(out reflect.Value, kind byte) (good bool) {
 				// Only set if value is compatible.
 				first = false
 				defer func(out, elem reflect.Value) {
-					if good {
+					if err == nil {
 						out.Set(elem)
 					}
 				}(out, elem)
@@ -608,32 +680,32 @@ func (d *decoder) readElemTo(out reflect.Value, kind byte) (good bool) {
 	inv := reflect.ValueOf(in)
 	if outt == inv.Type() {
 		out.Set(inv)
-		return true
+		return nil
 	}
 
 	switch outk {
 	case reflect.Interface:
 		out.Set(inv)
-		return true
+		return nil
 	case reflect.String:
 		switch inv.Kind() {
 		case reflect.String:
 			out.SetString(inv.String())
-			return true
+			return nil
 		case reflect.Slice:
 			if b, ok := in.([]byte); ok {
 				out.SetString(string(b))
-				return true
+				return nil
 			}
 		case reflect.Int, reflect.Int64:
 			if outt == typeJSONNumber {
 				out.SetString(strconv.FormatInt(inv.Int(), 10))
-				return true
+				return nil
 			}
 		case reflect.Float64:
 			if outt == typeJSONNumber {
 				out.SetString(strconv.FormatFloat(inv.Float(), 'f', -1, 64))
-				return true
+				return nil
 			}
 		}
 	case reflect.Slice, reflect.Array:
@@ -647,7 +719,7 @@ func (d *decoder) readElemTo(out reflect.Value, kind byte) (good bool) {
 		case reflect.String:
 			slice := []byte(inv.String())
 			out.Set(reflect.ValueOf(slice))
-			return true
+			return nil
 		case reflect.Slice:
 			switch outt.Kind() {
 			case reflect.Array:
@@ -655,23 +727,23 @@ func (d *decoder) readElemTo(out reflect.Value, kind byte) (good bool) {
 			case reflect.Slice:
 				out.SetBytes(inv.Bytes())
 			}
-			return true
+			return nil
 		}
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 		switch inv.Kind() {
 		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 			out.SetInt(inv.Int())
-			return true
+			return nil
 		case reflect.Float32, reflect.Float64:
 			out.SetInt(int64(inv.Float()))
-			return true
+			return nil
 		case reflect.Bool:
 			if inv.Bool() {
 				out.SetInt(1)
 			} else {
 				out.SetInt(0)
 			}
-			return true
+			return nil
 		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
 			panic("can't happen: no uint types in BSON (!?)")
 		}
@@ -679,17 +751,17 @@ func (d *decoder) readElemTo(out reflect.Value, kind byte) (good bool) {
 		switch inv.Kind() {
 		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 			out.SetUint(uint64(inv.Int()))
-			return true
+			return nil
 		case reflect.Float32, reflect.Float64:
 			out.SetUint(uint64(inv.Float()))
-			return true
+			return nil
 		case reflect.Bool:
 			if inv.Bool() {
 				out.SetUint(1)
 			} else {
 				out.SetUint(0)
 			}
-			return true
+			return nil
 		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
 			panic("Can't happen. No uint types in BSON.")
 		}
@@ -697,17 +769,17 @@ func (d *decoder) readElemTo(out reflect.Value, kind byte) (good bool) {
 		switch inv.Kind() {
 		case reflect.Float32, reflect.Float64:
 			out.SetFloat(inv.Float())
-			return true
+			return nil
 		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 			out.SetFloat(float64(inv.Int()))
-			return true
+			return nil
 		case reflect.Bool:
 			if inv.Bool() {
 				out.SetFloat(1)
 			} else {
 				out.SetFloat(0)
 			}
-			return true
+			return nil
 		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
 			panic("Can't happen. No uint types in BSON?")
 		}
@@ -715,13 +787,13 @@ func (d *decoder) readElemTo(out reflect.Value, kind byte) (good bool) {
 		switch inv.Kind() {
 		case reflect.Bool:
 			out.SetBool(inv.Bool())
-			return true
+			return nil
 		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 			out.SetBool(inv.Int() != 0)
-			return true
+			return nil
 		case reflect.Float32, reflect.Float64:
 			out.SetBool(inv.Float() != 0)
-			return true
+			return nil
 		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
 			panic("Can't happen. No uint types in BSON?")
 		}
@@ -732,17 +804,17 @@ func (d *decoder) readElemTo(out reflect.Value, kind byte) (good bool) {
 				panic(err)
 			}
 			out.Set(reflect.ValueOf(u).Elem())
-			return true
+			return nil
 		}
 		if outt == typeBinary {
 			if b, ok := in.([]byte); ok {
 				out.Set(reflect.ValueOf(Binary{Data: b}))
-				return true
+				return nil
 			}
 		}
 	}
 
-	return false
+	return &TypeError{inv.Type(), kind}
 }
 
 // --------------------------------------------------------------------------
