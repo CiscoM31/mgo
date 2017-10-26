@@ -41,7 +41,12 @@ type decoder struct {
 	in      []byte
 	i       int
 	docType reflect.Type
-	lenient bool // If true, be lenient when unmarshalling document. If false, return errors if BSON document is incompatible with receiving document.
+	// This parameter controls the unmarshaller behavior when the BSON value does not fit the receiving type
+	// and cannot be converted.
+	// If true, unmarshall returns an error if the BSON document is incompatible with the receiving type.
+	// If false, the unmarshaller is lenient when unmarshalling document. BSON values that do not fit the
+	// receiving type are not converted and silently skipped. This is the default behavior.
+	strict bool
 }
 
 var typeM = reflect.TypeOf(M{})
@@ -216,15 +221,15 @@ func (d *decoder) readDocTo(out reflect.Value) error {
 		switch outt.Elem() {
 		case typeDocElem:
 			v, err := d.readDocElems(outt)
-			if err != nil {
-				return nil
+			if err != nil && d.strict {
+				return err
 			}
 			origout.Set(v)
 			return nil
 		case typeRawDocElem:
 			v, err := d.readRawDocElems(outt)
-			if err != nil {
-				return nil
+			if err != nil && d.strict {
+				return err
 			}
 			origout.Set(v)
 			return nil
@@ -256,7 +261,7 @@ func (d *decoder) readDocTo(out reflect.Value) error {
 					k = k.Convert(keyType)
 				}
 				out.SetMapIndex(k, e)
-			} else if !d.lenient {
+			} else if d.strict {
 				return err
 			}
 		case reflect.Struct:
@@ -266,14 +271,14 @@ func (d *decoder) readDocTo(out reflect.Value) error {
 				if info, ok := fieldsMap[name]; ok {
 					if info.Inline == nil {
 						if err := d.readElemTo(out.Field(info.Num), kind); err != nil {
-							if !d.lenient {
-								return &TypeError{out.Field(info.Num).Type(), kind}
+							if d.strict {
+								return err
 							}
 						}
 					} else {
 						if err := d.readElemTo(out.FieldByIndex(info.Inline), kind); err != nil {
-							if !d.lenient {
-								return &TypeError{out.FieldByIndex(info.Inline).Type(), kind}
+							if d.strict {
+								return err
 							}
 						}
 					}
@@ -284,14 +289,14 @@ func (d *decoder) readDocTo(out reflect.Value) error {
 					e := reflect.New(elemType).Elem()
 					if err := d.readElemTo(e, kind); err == nil {
 						inlineMap.SetMapIndex(reflect.ValueOf(name), e)
-					} else {
-						if !d.lenient {
-							return &TypeError{e.Type(), kind}
-						}
+					} else if d.strict {
+						return err
 					}
 				} else {
 					if err := d.dropElem(kind); err != nil {
-						return err
+						if d.strict {
+							return err
+						}
 					}
 				}
 			}
@@ -335,8 +340,8 @@ func (d *decoder) readArrayDocTo(out reflect.Value) error {
 		}
 		d.i++
 		if err := d.readElemTo(out.Index(i), kind); err != nil {
-			if !d.lenient {
-				return &TypeError{out.Index(i).Type(), kind}
+			if d.strict {
+				return err
 			}
 		}
 		if d.i >= end {
@@ -380,8 +385,8 @@ func (d *decoder) readSliceDoc(t reflect.Type) (interface{}, error) {
 		if err := d.readElemTo(e, kind); err == nil {
 			tmp = append(tmp, e)
 		} else {
-			if !d.lenient {
-				return nil, &TypeError{e.Type(), kind}
+			if d.strict {
+				return nil, err
 			}
 		}
 		if d.i >= end {
@@ -414,13 +419,13 @@ func (d *decoder) readDocElems(typ reflect.Type) (reflect.Value, error) {
 		if err := d.readElemTo(v.Elem(), kind); err == nil {
 			slice = append(slice, e)
 		} else {
-			if !d.lenient {
+			if d.strict {
 				return err
 			}
 		}
 		return nil
 	})
-	if err != nil && !d.lenient {
+	if err != nil && d.strict {
 		return reflect.ValueOf(nil), err
 	}
 	slicev := reflect.New(typ).Elem()
@@ -439,13 +444,13 @@ func (d *decoder) readRawDocElems(typ reflect.Type) (reflect.Value, error) {
 		if err := d.readElemTo(v.Elem(), kind); err == nil {
 			slice = append(slice, e)
 		} else {
-			if !d.lenient {
+			if d.strict {
 				return err
 			}
 		}
 		return nil
 	})
-	if err != nil && !d.lenient {
+	if err != nil && d.strict {
 		return reflect.ValueOf(nil), err
 	}
 	slicev := reflect.New(typ).Elem()
@@ -467,7 +472,7 @@ func (d *decoder) readDocWith(f func(kind byte, name string) error) error {
 			corrupted()
 		}
 		err := f(kind, name)
-		if err != nil {
+		if err != nil && d.strict {
 			return err
 		}
 		if d.i >= end {
@@ -512,13 +517,13 @@ func (d *decoder) readElemTo(out reflect.Value, kind byte) (err error) {
 			switch outt.Elem() {
 			case typeDocElem:
 				v, err = d.readDocElems(outt)
-				if err != nil && !d.lenient {
+				if err != nil && d.strict {
 					return err
 				}
 				out.Set(v)
 			case typeRawDocElem:
 				v, err = d.readRawDocElems(outt)
-				if err != nil && !d.lenient {
+				if err != nil && d.strict {
 					return err
 				}
 				out.Set(v)
@@ -544,7 +549,7 @@ func (d *decoder) readElemTo(out reflect.Value, kind byte) (err error) {
 		if setterStyle(outt) != setterNone {
 			// Skip the value so its data is handed to the setter below.
 			err = d.dropElem(kind)
-			if err != nil {
+			if err != nil && d.strict {
 				return err
 			}
 			break
@@ -557,12 +562,12 @@ func (d *decoder) readElemTo(out reflect.Value, kind byte) (err error) {
 			return d.readArrayDocTo(out)
 		case reflect.Slice:
 			in, err = d.readSliceDoc(outt)
-			if err != nil {
+			if err != nil && d.strict {
 				return err
 			}
 		default:
 			in, err = d.readSliceDoc(typeSlice)
-			if err != nil {
+			if err != nil && d.strict {
 				return err
 			}
 		}
@@ -601,7 +606,7 @@ func (d *decoder) readElemTo(out reflect.Value, kind byte) (err error) {
 		d.i += 4 // Skip length
 		js := JavaScript{d.readStr(), make(M)}
 		err := d.readDocTo(reflect.ValueOf(js.Scope))
-		if err != nil {
+		if err != nil && d.strict {
 			return err
 		}
 		in = js
