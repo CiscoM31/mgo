@@ -9,12 +9,14 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
 
-	"gopkg.in/mgo.v2"
+	mgo "github.com/globalsign/mgo"
 	"gopkg.in/tomb.v2"
+
 )
 
 // Constants to define how the DB test instance should be executed
@@ -286,6 +288,7 @@ func (dbs *DBServer) start() {
 			panic(err2)
 		}
 		dbs.host = fmt.Sprintf("127.0.0.1:%d", p)
+
 	}
 	dbs.tomb.Go(dbs.monitor)
 	dbs.Wipe()
@@ -362,6 +365,7 @@ func (dbs *DBServer) Stop() {
 			dbs.stopContainer()
 		}
 		dbs.server.Process.Signal(os.Interrupt)
+
 		select {
 		case <-dbs.tomb.Dead():
 		case <-time.After(5 * time.Second):
@@ -403,7 +407,7 @@ func (dbs *DBServer) Session() *mgo.Session {
 
 // checkSessions ensures all mgo sessions opened were properly closed.
 // For slightly faster tests, it may be disabled setting the
-// environmnet variable CHECK_SESSIONS to 0.
+// environment variable CHECK_SESSIONS to 0.
 func (dbs *DBServer) checkSessions() {
 	if check := os.Getenv("CHECK_SESSIONS"); check == "0" || dbs.server == nil || dbs.session == nil {
 		return

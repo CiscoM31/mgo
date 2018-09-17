@@ -131,7 +131,7 @@ func TestDecoder(t *testing.T) {
 		for _, c := range nlines(streamEncoded, i) {
 			// That's stupid isn't it!? nulltrue!?!? :/
 			//if c != '\n' {
-				buf.WriteRune(c)
+			buf.WriteRune(c)
 			//}
 		}
 		out := make([]interface{}, i)
@@ -282,7 +282,7 @@ type decodeThis struct {
 	v interface{}
 }
 
-var tokenStreamCases []tokenStreamCase = []tokenStreamCase{
+var tokenStreamCases = []tokenStreamCase{
 	// streaming token cases
 	{json: `10`, expTokens: []interface{}{float64(10)}},
 	{json: ` [10] `, expTokens: []interface{}{

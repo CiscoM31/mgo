@@ -33,7 +33,7 @@ import (
 	"regexp"
 	"strings"
 
-	"gopkg.in/mgo.v2/bson"
+	"github.com/globalsign/mgo/bson"
 
 	. "gopkg.in/check.v1"
 )
@@ -166,7 +166,7 @@ func (s *S) BenchmarkDecimal128String(c *C) {
 
 	c.ResetTimer()
 	for i := 0; i < c.N; i++ {
-		d.String()
+		_ = d.String()
 	}
 }
 
