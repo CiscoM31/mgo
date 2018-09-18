@@ -9,14 +9,12 @@ import (
 	"net"
 	"os"
 	"os/exec"
-	"runtime"
 	"strconv"
 	"strings"
 	"time"
 
 	mgo "github.com/globalsign/mgo"
 	"gopkg.in/tomb.v2"
-
 )
 
 // Constants to define how the DB test instance should be executed
